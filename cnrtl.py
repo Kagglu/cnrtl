@@ -27,6 +27,8 @@ Sense addressing:
 Anki:
     cnrtl <word> --anki              Add a card to the default deck (Français)
     cnrtl <word> --anki --deck NAME  Add a card to a specific deck
+    cnrtl --sync                     Trigger AnkiWeb sync (no word needed)
+    cnrtl <word> --anki --sync       Add a card and sync immediately
     Requires Anki to be open with the AnkiConnect add-on installed.
 """
 
@@ -87,6 +89,7 @@ ABBREVS = [
     ("vx.", "vieux"),
     ("spéc.", "spécialement"),
     ("absolt.", "absolument"),
+    ("En partic.", "en particulier"),
     ("partic.", "particulièrement"),
     ("loc.", "locution"),
     ("Loc.", "Locution"),
@@ -171,6 +174,16 @@ class PageParser(HTMLParser):
 
 
 # ── Text helpers ───────────────────────────────────────────────────────────
+
+def highlight_text(text, query):
+    if not query:
+        return text
+    return re.sub(
+        re.escape(query),
+        lambda m: f"\033[43m\033[30m{m.group()}\033[0m",
+        text,
+        flags=re.IGNORECASE,
+    )
 
 def clean(text):
     """Collapse whitespace."""
@@ -307,7 +320,8 @@ def render_parah(node, depth, show_ex, detail=False):
             defn_seen = True
 
         elif "tlf_cemploi" in cls:
-            emploi = clean(expand_abbrevs(c.text())).strip(":").strip()
+            if not defn_seen:
+                emploi = clean(expand_abbrevs(c.text())).strip(":").strip()
 
         elif "tlf_ccrochet" in cls and not crochet:
             crochet = clean(c.text())
@@ -348,13 +362,13 @@ def render_parah(node, depth, show_ex, detail=False):
     if plan:
         parts.append(f"\033[1m{plan}\033[0m")
     if domaine:
-        parts.append(domaine)
+        parts.append(f"\033[4m{domaine}\033[0m")
     if expr:
         parts.append(f"\033[3m{expr}\033[0m")
     if emploi:
-        parts.append(f"({emploi})")
+        parts.append(f"\033[4m({emploi})\033[0m")
     if crochet and not emploi:
-        parts.append(crochet)
+        parts.append(f"\033[4m{crochet}\033[0m")
     if defn:
         parts.append(defn)
 
@@ -522,13 +536,14 @@ def find_sense_node(top_parahs, path):
 # Patterns that introduce the etymological analysis (after historical attestations)
 _ORIGIN_MARKER = re.compile(
     r'(?:'
-    r'Empr\.?\s+au\s'
+    r'Empr\.?[,\s]+'
     r'|Du\s+(?:(?:b|a|m|moy)\.?\s+)?(?:lat|gr|frq|germ|frk)\b'
-    r'|De\s+l\'(?:a\.?\s+)?(?:angl|esp|ital|arab|all|néerl|prov|occit|turc|persan|hébr)\b'
-    r'|Mot\s+\w+'
+    r'|D\'un\s+(?:(?:gallo|franc|a|b|m|moy)\.?-?\s*)?(?:lat|gr|frq|germ|frk)\b'
+    r'|De\s+l\'(?:(?:a|anc|b|bas|m|moy|h|haut)\.?\s+)*(?:angl|esp|ital|arab|all|néerl|prov|occit|scand|frq|turc|persan|hébr)\b'
     r'|[A-C]\s+[Dd]u\s+(?:(?:b|a)\.?\s+)?lat\b'
-    r'|Dér(?:ivé)?\.?\s+(?:de|du)\b'
+    r'|Dér(?:ivé)?\.?\s+(?:de|du|en)\b'
     r'|Comp(?:osé)?\.?\s+(?:de|du)\b'
+    r'|Tiré\s+de\b'
     r'|Issu\s+de\b'
     r'|[ÉE]tymol\.?\s+(?:incertaine|controversée|obscure|inconnue|mal\s+conn|discutée)\b'
     r'|D\'orig(?:ine)?\.?\s+\w+'
@@ -558,12 +573,20 @@ def extract_origin(etym_text):
     text = re.sub(r'^[ÉE]tymol\.?\s+et\s+Hist\.?\s*', '', etym_text,
                   flags=re.IGNORECASE).strip()
 
-    # Locate the transition from attestations to etymology analysis
+    # Locate the transition from attestations to etymology analysis.
+    # Skip matches whose first character is lowercase — those are embedded in
+    # bibliographic citations (e.g. "[trad. de l'ital.]"), not origin statements.
     m = _ORIGIN_MARKER.search(text)
+    while m and text[m.start()].islower():
+        m = _ORIGIN_MARKER.search(text, m.end())
     origin_pos = m.start() if m else len(text)
 
-    # First attestation date (from the block before the analysis)
+    # First attestation date (from the block before the analysis).
+    # Skip dates immediately preceded by '[' — these are bracketed Latin/medieval
+    # pre-attestations, not the first French citation.
     dm = _FIRST_DATE.search(text[:origin_pos])
+    while dm and dm.start() > 0 and text[dm.start() - 1] == '[':
+        dm = _FIRST_DATE.search(text[:origin_pos], dm.end())
     first_date = dm.group(0).strip() if dm else ''
 
     if not m:
@@ -587,12 +610,16 @@ def extract_origin(etym_text):
     if 0 < idx <= 350:
         snippet = origin[:idx + 1].strip()
         rest = origin[idx + 1:].lstrip()
-        if rest and rest[0] in '.,':
+        if rest and rest[0] == '.':
             snippet += rest[0]
         return (f"{first_date}  ·  {snippet}" if first_date else snippet)
 
-    # No guillemet: truncate at 200 chars on a word boundary
-    if len(origin) > 200:
+    # No guillemet: try stopping at a TLFi section cross-reference (" : I 2", " : II 1" …)
+    # before falling back to the 200-char word-boundary truncation.
+    sec_ref = re.search(r'\s+:\s+[IVX]+\s+\d', origin)
+    if sec_ref and sec_ref.start() < 150:
+        snippet = origin[:sec_ref.start()].strip()
+    elif len(origin) > 200:
         snippet = origin[:200].rsplit(' ', 1)[0] + '…'
     else:
         snippet = origin.strip()
@@ -689,14 +716,15 @@ def _collect_definitions(node, results=None):
             defn = clean(c.text())
             defn_seen = True
         elif "tlf_cemploi" in cls:
-            emploi = clean(expand_abbrevs(c.text())).strip(":").strip()
+            if not defn_seen:
+                emploi = clean(expand_abbrevs(c.text())).strip(":").strip()
         elif "tlf_ccrochet" in cls and not crochet:
             crochet = clean(c.text())
         elif "tlf_parah" in cls or "tlf_paraputir" in cls:
             sub_nodes.append(c)
 
     if defn:
-        # Build plain-text version (for terminal display / selection list)
+        # Build plain-text version (for width calculation)
         plain_parts = []
         if domaine:
             plain_parts.append(domaine)
@@ -711,17 +739,30 @@ def _collect_definitions(node, results=None):
         # Build HTML version (for Anki card back)
         html_parts = []
         if domaine:
-            html_parts.append(html_escape(domaine))
+            html_parts.append(f"<u>{html_escape(domaine)}</u>")
         if expr:
             html_parts.append(f"<i>{html_escape(expr)}</i>")
         if emploi:
-            html_parts.append(f"({html_escape(emploi)})")
+            html_parts.append(f"<u>({html_escape(emploi)})</u>")
         elif crochet:
-            html_parts.append(html_escape(crochet))
+            html_parts.append(f"<u>{html_escape(crochet)}</u>")
         html_parts.append(html_escape(defn))
         html = " ".join(html_parts)
 
-        results.append((plain, html))
+        # Build ANSI version (for terminal selection list)
+        ansi_parts = []
+        if domaine:
+            ansi_parts.append(f"\033[4m{domaine}\033[0m")
+        if expr:
+            ansi_parts.append(f"\033[3m{expr}\033[0m")
+        if emploi:
+            ansi_parts.append(f"\033[4m({emploi})\033[0m")
+        elif crochet:
+            ansi_parts.append(f"\033[4m{crochet}\033[0m")
+        ansi_parts.append(defn)
+        ansi = " ".join(ansi_parts)
+
+        results.append((plain, html, ansi))
 
     for sub in sub_nodes:
         _collect_definitions(sub, results)
@@ -836,7 +877,8 @@ def extract_anki_data(root):
         if defn:
             plain = (domaine + " " if domaine else "") + defn
             html  = (html_escape(domaine) + " " if domaine else "") + html_escape(defn)
-            definitions.append((plain, html))
+            ansi  = (f"\033[4m{domaine}\033[0m " if domaine else "") + defn
+            definitions.append((plain, html, ansi))
 
     return front_html, definitions, pron
 
@@ -911,6 +953,15 @@ def anki_add_card(front_html, back_html, deck="Français"):
         sys.exit(1)
 
     return r["result"]
+
+
+def anki_sync():
+    """Trigger AnkiWeb sync via AnkiConnect. Anki must be open and logged in."""
+    r = _anki_request("sync")
+    if r.get("error"):
+        print(f"Erreur AnkiConnect (sync) : {r['error']}", file=sys.stderr)
+        sys.exit(1)
+    print("Anki synchronisé avec AnkiWeb.")
 
 
 # ── Top-level renderer ─────────────────────────────────────────────────────
@@ -1023,11 +1074,11 @@ def render(root, show_ex, sense_path=None):
     if defn or emploi or crochet or domaine:
         parts = []
         if domaine:
-            parts.append(domaine)
+            parts.append(f"\033[4m{domaine}\033[0m")
         if emploi:
-            parts.append(f"({emploi})")
+            parts.append(f"\033[4m({emploi})\033[0m")
         if crochet and not emploi:
-            parts.append(crochet)
+            parts.append(f"\033[4m{crochet}\033[0m")
         if defn:
             parts.append(defn)
 
@@ -1210,8 +1261,11 @@ _INTERACTIVE_HELP = """\
   <mot> --etym               Afficher l'origine du mot (date + source, minimal)
   <mot> --etym-full          Afficher l'étymologie et l'histoire complètes
   <mot> --tab N              Afficher l'entrée N (si plusieurs entrées existent)
+  <mot> --hl TEXTE            Surligner TEXTE en jaune dans les résultats
   <mot> --anki               Créer une carte Anki (paquet par défaut : Français)
   <mot> --anki --deck NOM    Créer une carte Anki dans un paquet spécifique
+  <mot> --anki --sync        Créer une carte Anki puis synchroniser
+  sync                       Synchroniser Anki avec AnkiWeb
   help                       Afficher cette aide
   quit / exit                Quitter\
 """
@@ -1229,8 +1283,17 @@ def _run_command(args):
 
     show_ex       = "-e" in args or "--examples" in args
     do_anki       = "--anki" in args
+    do_sync       = "--sync" in args
     do_etym_full  = "--etym-full" in args
     do_etym       = "--etym" in args and not do_etym_full
+
+    highlight = None
+    if "--hl" in args:
+        idx = args.index("--hl")
+        if idx + 1 >= len(args):
+            print("--hl requiert un texte à surligner.", file=sys.stderr)
+            sys.exit(1)
+        highlight = args[idx + 1]
 
     # Parse --deck NAME
     deck = "Français"
@@ -1263,14 +1326,19 @@ def _run_command(args):
         if skip_next:
             skip_next = False
             continue
-        if a in ("--deck", "--tab"):
+        if a in ("--deck", "--tab", "--hl"):
             skip_next = True
             continue
         if not a.startswith("-"):
             non_flags.append(a)
 
+    # --sync alone (no word) just triggers AnkiWeb sync and exits
+    if do_sync and not non_flags and not do_anki:
+        anki_sync()
+        return
+
     if not non_flags:
-        print("Usage : <mot> [sens] [-e] [--anki [--deck NOM]] [--tab N]", file=sys.stderr)
+        print("Usage : <mot> [sens] [-e] [--anki [--deck NOM]] [--tab N] | --sync", file=sys.stderr)
         sys.exit(1)
 
     word       = non_flags[0]
@@ -1293,14 +1361,8 @@ def _run_command(args):
             sys.exit(1)
 
         print()
-        for i, (plain, _) in enumerate(definitions, 1):
-            wrapped = textwrap.fill(
-                plain,
-                width=88,
-                initial_indent=f"  {i}. ",
-                subsequent_indent=" " * (len(str(i)) + 4),
-            )
-            print(wrapped)
+        for i, (_, _, ansi) in enumerate(definitions, 1):
+            print(f"  {i}. {ansi}")
         print()
 
         while True:
@@ -1329,6 +1391,8 @@ def _run_command(args):
         front_html, back_html = build_anki_card(front_html, selected, pron)
         note_id = anki_add_card(front_html, back_html, deck)
         print(f"Carte ajoutée au paquet « {deck} » (note ID : {note_id}).")
+        if do_sync:
+            anki_sync()
         return
 
     if do_etym or do_etym_full:
@@ -1354,9 +1418,9 @@ def _run_command(args):
         print(f"\033[1m{word_label}\033[0m\n")
 
         if do_etym_full:
-            print(textwrap.fill(etym, width=88))
+            print(highlight_text(textwrap.fill(etym, width=88), highlight))
         else:
-            print(extract_origin(etym))
+            print(highlight_text(extract_origin(etym), highlight))
 
         if tab_bar:
             print(tab_bar)
@@ -1373,7 +1437,7 @@ def _run_command(args):
 
     if tab_bar:
         result += "\n" + tab_bar
-    print(result)
+    print(highlight_text(result, highlight))
 
 
 _DIVIDER = "\033[2m" + "─" * 88 + "\033[0m"
@@ -1408,6 +1472,14 @@ def _interactive_loop():
             print()
             print(_INTERACTIVE_HELP)
             print()
+            continue
+
+        if line.lower() in ("sync", "synchroniser"):
+            print(_DIVIDER)
+            try:
+                anki_sync()
+            except SystemExit:
+                pass
             continue
 
         try:
